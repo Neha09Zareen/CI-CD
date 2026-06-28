@@ -179,6 +179,8 @@ __marimo__/
 
 # Project-specific
 hindsight_db.json
+failure_store.json
+failure_store.json.tmp
 
 # cloudflared tunnel artifacts (not project code)
 cloudflared-windows-amd64.exe

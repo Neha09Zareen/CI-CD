@@ -1,96 +1,228 @@
 """FastAPI application entrypoint for the AI CI/CD Agent.
 
-Receives GitHub Actions workflow webhooks, detects pipeline failures,
-and fetches the raw logs for the failed job. Run locally with:
-    uvicorn src.main:app --reload
+Thin, fast HTTP surface for the Brain:
+- POST /webhook            receive GitHub workflow_run events, ack fast, process in background
+- GET  /health             service + dependency readiness
+- GET  /api/failures       list processed failures (newest first)
+- GET  /api/failures/{id}  one failure record
+- POST /api/failures/{id}/approve   approve (optionally edited) fix
+- POST /api/failures/{id}/reject    reject with optional reason
+- GET  /api/memory         list Hindsight entries
+- DELETE /api/memory/{key} remove a Hindsight entry
+- GET  /api/stats          aggregate counts
+- GET  /api/stream         Server-Sent Events feed of live progress
+
+Run locally with:  uvicorn src.main:app --reload
 """
 
 from __future__ import annotations
 
-import os
+import asyncio
+import json
+import logging
 
-import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from github import Github
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
-from .cascade_parser import cascade_chunk_logs
-from .cascade_flow import analyze_logs_with_cascadeflow
+from .config import get_settings
+from .events import bus
+from .hindsight import delete_entry, list_entries, retain_successful_fix
+from .models import ApproveBody, RejectBody, StepEvent
+from .pipeline import handle_failure
+from .store import store
 
 load_dotenv()
 
-app = FastAPI(title="AI CI/CD Agent")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("ci_cd_agent")
 
-# Initialize PyGithub
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-if not GITHUB_TOKEN:
-    raise ValueError("GITHUB_TOKEN is missing from .env")
+settings = get_settings()
 
-gh = Github(GITHUB_TOKEN)
+app = FastAPI(title="AI CI/CD Agent", version="2.0.0")
 
-
-def fetch_failed_job_logs(repo_name: str, run_id: int) -> str:
-    """Fetches the raw logs for the failed job in a workflow run."""
-    repo = gh.get_repo(repo_name)
-    run = repo.get_workflow_run(run_id)
-
-    # Iterate through jobs to find the specific one that failed
-    for job in run.jobs():
-        if job.conclusion == "failure":
-            # PyGithub doesn't expose a direct method that returns the log
-            # text, so we hit the GitHub REST API directly for the raw log
-            # using our token. GitHub responds with a 302 redirect to a
-            # short-lived signed URL; requests follows it automatically.
-            log_url = (
-                f"https://api.github.com/repos/{repo_name}"
-                f"/actions/jobs/{job.id}/logs"
-            )
-            headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
-            response = requests.get(log_url, headers=headers)
-            if response.status_code == 200:
-                return response.text
-            print(f"Failed to fetch logs: {response.status_code}")
-            return ""
-    return ""
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
 @app.post("/webhook")
-async def github_webhook(request: Request):
+async def github_webhook(request: Request, background: BackgroundTasks):
+    """Receive a GitHub webhook, acknowledge fast, process failures async."""
     try:
         payload = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Extract required fields. Non-workflow_run events (push, ping, etc.)
-    # are valid deliveries we simply don't act on, so acknowledge with 200.
     workflow_run = payload.get("workflow_run")
     if not workflow_run:
         return {"status": "ignored", "reason": "No workflow_run in payload"}
 
-    run_id = workflow_run.get("id")
     conclusion = workflow_run.get("conclusion")
+    if conclusion != "failure":
+        return {"status": "ignored", "reason": f"Conclusion was {conclusion}"}
+
+    run_id = workflow_run.get("id")
     repo_name = payload.get("repository", {}).get("full_name")
+    if run_id is None or not repo_name:
+        return {"status": "ignored", "reason": "Missing run id or repository"}
 
-    if conclusion == "failure":
-        print(f"🚨 Pipeline failure detected! Run ID: {run_id} in {repo_name}")
+    logger.info("Failure accepted: run %s in %s", run_id, repo_name)
+    # No heavy work on the request path — hand off to the background.
+    background.add_task(handle_failure, int(run_id), repo_name)
+    return {"status": "accepted", "run_id": run_id}
 
-        # 1. Fetch the raw logs
-        raw_logs = fetch_failed_job_logs(repo_name, run_id)
-        if not raw_logs:
-            return {"status": "error", "message": "Could not retrieve logs."}
 
-        print(f"✅ Successfully fetched logs. Length: {len(raw_logs)} characters.")
+# ---------------------------------------------------------------------------
+# Health & stats
+# ---------------------------------------------------------------------------
+@app.get("/health")
+def health() -> dict:
+    """Report service status and dependency readiness (no secret values)."""
+    return {
+        "status": "ok",
+        "dependencies": {
+            "groq_key_present": settings.has_groq,
+            "github_token_present": settings.has_github,
+        },
+        "stream_subscribers": bus.subscriber_count,
+    }
 
-        # 3. Pre-parse logs into overlapping chunks via Cascade
-        chunks = cascade_chunk_logs(raw_logs)
-        print(f"📦 Parsed into {len(chunks)} chunks via Cascade.")
 
-        # 4. Route chunks via cascadeflow and generate a fix
-        fix = analyze_logs_with_cascadeflow(chunks)
-        print("🛠️ cascadeflow analysis complete.")
+@app.get("/api/stats")
+def stats() -> dict:
+    return store.stats()
 
-        # TODO: Step 5 - Store/Lookup in Hindsight
 
-        return {"status": "processing", "run_id": run_id, "fix": fix}
+# ---------------------------------------------------------------------------
+# Failures
+# ---------------------------------------------------------------------------
+@app.get("/api/failures")
+def list_failures() -> list[dict]:
+    return [json.loads(r.model_dump_json()) for r in store.list()]
 
-    return {"status": "ignored", "reason": f"Conclusion was {conclusion}"}
+
+@app.get("/api/failures/{run_id}")
+def get_failure(run_id: int) -> dict:
+    record = store.get(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Failure not found")
+    return json.loads(record.model_dump_json())
+
+
+def _emit_status(record, step: str, detail: str | None = None) -> None:
+    event = StepEvent(
+        run_id=record.run_id,
+        repo=record.repo,
+        type="status",
+        step=step,
+        status=record.status,
+        detail=detail,
+    )
+    record.steps.append(event)
+    bus.publish(json.loads(event.model_dump_json()))
+
+
+@app.post("/api/failures/{run_id}/approve")
+def approve_failure(run_id: int, body: ApproveBody | None = None) -> dict:
+    body = body or ApproveBody()
+    record = store.get(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Failure not found")
+    if record.status in ("approved", "rejected"):
+        raise HTTPException(
+            status_code=409, detail=f"Already {record.status}"
+        )
+
+    if body.edited_fix is not None:
+        record.suggested_fix = body.edited_fix
+
+    # Retain the (possibly edited) fix so the next identical failure is instant.
+    culprit = record.log_excerpt
+    if record.suggested_fix and culprit:
+        retain_successful_fix(culprit, record.suggested_fix)
+
+    record.status = "approved"
+    store.upsert(record)
+    _emit_status(record, "approve", "fix approved")
+    return json.loads(record.model_dump_json())
+
+
+@app.post("/api/failures/{run_id}/reject")
+def reject_failure(run_id: int, body: RejectBody | None = None) -> dict:
+    body = body or RejectBody()
+    record = store.get(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Failure not found")
+    if record.status in ("approved", "rejected"):
+        raise HTTPException(
+            status_code=409, detail=f"Already {record.status}"
+        )
+
+    record.status = "rejected"
+    record.reject_reason = body.reason
+    store.upsert(record)
+    _emit_status(record, "reject", body.reason)
+    return json.loads(record.model_dump_json())
+
+
+# ---------------------------------------------------------------------------
+# Memory (Hindsight)
+# ---------------------------------------------------------------------------
+@app.get("/api/memory")
+def get_memory() -> dict:
+    return list_entries()
+
+
+@app.delete("/api/memory/{key}")
+def remove_memory(key: str) -> dict:
+    removed = delete_entry(key)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Memory entry not found")
+    return {"status": "deleted", "key": key}
+
+
+# ---------------------------------------------------------------------------
+# SSE stream
+# ---------------------------------------------------------------------------
+@app.get("/api/stream")
+async def stream(request: Request) -> StreamingResponse:
+    """Server-Sent Events feed of live pipeline progress."""
+
+    async def event_generator():
+        queue = bus.subscribe()
+        try:
+            # Initial comment so clients know the stream is open.
+            yield ": connected\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    # Keepalive to hold the connection through idle periods.
+                    yield ": keepalive\n\n"
+        finally:
+            bus.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
