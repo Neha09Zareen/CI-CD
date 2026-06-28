@@ -1,0 +1,15 @@
+name: Lab Rat Webhook Test
+
+on: [push]
+
+jobs:
+  force-failure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Execute Failing Script
+        run: |
+          echo "Intentionally failing this build to test the webhook..."
+          exit 1
