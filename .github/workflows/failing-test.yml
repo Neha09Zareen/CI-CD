@@ -1,0 +1,26 @@
+name: Failing Test
+
+# A workflow that intentionally fails, used to exercise the AI CI/CD Agent.
+# It can be triggered by a push to main or manually from the Actions tab.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run a test that fails on purpose
+        run: |
+          echo "Starting test suite..."
+          echo "Running test_addition..."
+          python -c "assert 1 + 1 == 3, 'Math is broken: expected 1 + 1 to equal 3'"
